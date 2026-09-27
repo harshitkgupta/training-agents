@@ -1,0 +1,4 @@
+interface:
+  display_name: "Apple Silicon ML"
+  short_description: "Run local ML work on Apple-Silicon Macs."
+  default_prompt: "Use $apple-silicon-ml to set up or adapt this local ML task for PyTorch MPS."

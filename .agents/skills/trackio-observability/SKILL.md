@@ -14,10 +14,14 @@ Use this skill to make training runs observable and debuggable.
 2. Add Trackio. For any remote Hugging Face Job, initialize a hosted dashboard
    with `trackio.init(..., space_id="owner/space")`; only short local smoke
    tests may stay local or skip tracking with an explicit reason.
-3. Make logs grep-friendly with clear phase markers.
-4. Persist artifacts intentionally: model, adapter, config, metrics, traces, and
+3. Local & Custom Storage:
+   - Always set `os.environ["TRACKIO_DIR"]` **before** `import trackio`, as module-level globals bind at import time.
+   - Configure explicit directory paths (`--trackio-dir` or `TRACKIO_DIR`) rather than relying on heuristic directory scanning.
+   - Run `PRAGMA wal_checkpoint(FULL)` or commit active transactions before querying the SQLite database for live experiment metrics.
+4. Make logs grep-friendly with clear phase markers.
+5. Persist artifacts intentionally: model, adapter, config, metrics, traces, and
    evaluation outputs.
-5. Inspect remote state with the narrowest tool: Trackio dashboard, HF CLI,
+6. Inspect remote state with the narrowest tool: Trackio dashboard, HF CLI,
    `rg`, or SFTP when configured.
 
 ## Reporting Shape
