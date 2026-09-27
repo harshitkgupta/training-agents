@@ -163,11 +163,20 @@ def run_single_train(
     lora_alpha: int = 32,
     lora_layers: int = 24,
     trackio_project: str = DEFAULT_PROJECT,
+    trackio_group: str = "",
+    trackio_space_id: str = "",
+    trackio_private_space: bool = False,
     trackio_dir: str = ".",
     run_name: str = "",
+    push_to_hub: bool = False,
+    hub_model_id: str = "",
+    hub_private_repo: bool = True,
     dry_run: bool = False,
     force_restart: bool = False,
 ) -> int:
+    if push_to_hub and not hub_model_id:
+        sys.exit("Error: --push-to-hub requires --hub-model-id (e.g. --hub-model-id user/model-name).")
+
     backend = backend.lower()
     clean_model_tag = model.split("/")[-1].lower().replace(".", "-")
     auto_run_name = run_name or f"{clean_model_tag}-{backend}-{max_length}ctx-{steps}steps"
@@ -210,6 +219,16 @@ def run_single_train(
         ]
         if resolved_trackio_dir:
             cmd.extend(["--trackio-dir", resolved_trackio_dir])
+        if trackio_group:
+            cmd.extend(["--trackio-group", trackio_group])
+        if trackio_space_id:
+            cmd.extend(["--trackio-space-id", trackio_space_id])
+            if trackio_private_space:
+                cmd.append("--trackio-private-space")
+        if push_to_hub and hub_model_id:
+            cmd.extend(["--push-to-hub", "--hub-model-id", hub_model_id])
+            if not hub_private_repo:
+                cmd.append("--no-hub-private-repo")
         if status == "resume":
             print(f"\n[RESUME] Task '{auto_run_name}' found breakpoint at {resume_arg}. Resuming from checkpoint!", flush=True)
             cmd.extend(["--resume-from-checkpoint", resume_arg])
@@ -235,6 +254,16 @@ def run_single_train(
         ]
         if resolved_trackio_dir:
             cmd.extend(["--trackio-dir", resolved_trackio_dir])
+        if trackio_group:
+            cmd.extend(["--trackio-group", trackio_group])
+        if trackio_space_id:
+            cmd.extend(["--trackio-space-id", trackio_space_id])
+            if trackio_private_space:
+                cmd.append("--trackio-private-space")
+        if push_to_hub and hub_model_id:
+            cmd.extend(["--push-to-hub", "--hub-model-id", hub_model_id])
+            if not hub_private_repo:
+                cmd.append("--no-hub-private-repo")
         for candidate_pattern in (f"workspaces/*{clean_model_tag}*-pi-mono-sft/mlx_data", "workspaces/*-pi-mono-sft/mlx_data"):
             matched_dirs = sorted(glob.glob(candidate_pattern))
             if matched_dirs:
@@ -279,10 +308,27 @@ SUITES: dict[str, list[dict[str, Any]]] = {
             "learning_rate": 1e-4,
             "run_name": "qwen-0.5b-mlx-2k",
         },
+        {
+            # Precision-isolated comparison, paired with Exp 6 below at the 1.5B size.
+            # Same reasoning as Exp 6: literal HF repo id, no "-4bit" suffix, so
+            # resolve_model_id() returns it unchanged and mlx_lm loads native
+            # precision (bf16) with no dequantization step. Two model sizes let us
+            # check whether the framework-only MPS-vs-MLX gap (with quantization
+            # removed as a variable) holds consistently across model scale, not
+            # just at 1.5B.
+            "name": "Exp 3: Qwen2.5-0.5B Apple MLX 2k, 16-bit (no quantization)",
+            "backend": "mlx",
+            "model": "Qwen/Qwen2.5-0.5B-Instruct",
+            "max_length": 2048,
+            "steps": 509,
+            "batch_size": 4,
+            "learning_rate": 1e-4,
+            "run_name": "qwen-0.5b-mlx16-2k",
+        },
     ],
     "model_scaling": [
         {
-            "name": "Exp 3: Qwen2.5-1.5B PyTorch MPS 2k",
+            "name": "Exp 4: Qwen2.5-1.5B PyTorch MPS 2k",
             "backend": "mps",
             "model": "1.5b",
             "max_length": 2048,
@@ -292,7 +338,7 @@ SUITES: dict[str, list[dict[str, Any]]] = {
             "run_name": "qwen-1.5b-mps-2k",
         },
         {
-            "name": "Exp 4: Qwen2.5-1.5B Apple MLX 2k",
+            "name": "Exp 5: Qwen2.5-1.5B Apple MLX 2k",
             "backend": "mlx",
             "model": "1.5b",
             "max_length": 2048,
@@ -302,7 +348,7 @@ SUITES: dict[str, list[dict[str, Any]]] = {
             "run_name": "qwen-1.5b-mlx-2k",
         },
         {
-            "name": "Exp 5: Qwen2.5-3B Apple MLX 2k",
+            "name": "Exp 6: Qwen2.5-3B Apple MLX 2k",
             "backend": "mlx",
             "model": "3b",
             "max_length": 2048,
@@ -311,10 +357,22 @@ SUITES: dict[str, list[dict[str, Any]]] = {
             "learning_rate": 1e-4,
             "run_name": "qwen-3b-mlx-2k",
         },
+        {
+            # Precision-isolated comparison: same model, same context, no quantization.
+            # See Exp 3 above for the matching 0.5B pair and the full reasoning.
+            "name": "Exp 7: Qwen2.5-1.5B Apple MLX 2k, 16-bit (no quantization)",
+            "backend": "mlx",
+            "model": "Qwen/Qwen2.5-1.5B-Instruct",
+            "max_length": 2048,
+            "steps": 509,
+            "batch_size": 4,
+            "learning_rate": 1e-4,
+            "run_name": "qwen-1.5b-mlx16-2k",
+        },
     ],
     "context_scaling": [
         {
-            "name": "Exp 6: Qwen2.5-1.5B Apple MLX 1k Context",
+            "name": "Exp 8: Qwen2.5-1.5B Apple MLX 1k Context",
             "backend": "mlx",
             "model": "1.5b",
             "max_length": 1024,
@@ -324,7 +382,7 @@ SUITES: dict[str, list[dict[str, Any]]] = {
             "run_name": "qwen-1.5b-mlx-1k",
         },
         {
-            "name": "Exp 7: Qwen2.5-1.5B Apple MLX 4k Context",
+            "name": "Exp 9: Qwen2.5-1.5B Apple MLX 4k Context",
             "backend": "mlx",
             "model": "1.5b",
             "max_length": 4096,
@@ -334,7 +392,7 @@ SUITES: dict[str, list[dict[str, Any]]] = {
             "run_name": "qwen-1.5b-mlx-4k",
         },
         {
-            "name": "Exp 8: Qwen2.5-1.5B PyTorch MPS 4k Context",
+            "name": "Exp 10: Qwen2.5-1.5B PyTorch MPS 4k Context",
             "backend": "mps",
             "model": "1.5b",
             "max_length": 4096,
@@ -384,6 +442,110 @@ def run_suite(suite_name: str, dry_run: bool = False, force_restart: bool = Fals
     if resolved_trackio_dir:
         comp_cmd.extend(["--trackio-dir", resolved_trackio_dir])
     subprocess.run(comp_cmd)
+
+
+# ---------------------------------------------------------------------------
+# Trackio Space Publisher
+# ---------------------------------------------------------------------------
+
+def publish_db(project: str, space_id: str, trackio_dir: str, private: bool, force: bool, dry_run: bool) -> int:
+    """Syncs a local Trackio project's SQLite database to a Space via trackio.sync().
+
+    trackio.sync() resolves its local source through SQLiteStorage, which --
+    like every other trackio entry point in this codebase -- reads TRACKIO_DIR.
+    This function sets that env var explicitly from --trackio-dir before
+    calling sync(), so the source is a deliberate choice, not whatever
+    TRACKIO_DIR happens to be set to in the calling shell. Relevant if you've
+    ended up with more than one local .db for the same project (see
+    compare_runs.py --diff / --find-all): pick the one you've verified is
+    correct and pass it explicitly.
+    """
+    resolved_dir = str(Path(trackio_dir).resolve())
+    if dry_run:
+        print(
+            f"[DRY-RUN] would sync project={project} from TRACKIO_DIR={resolved_dir} "
+            f"to space_id={space_id} (private={private}, force={force})",
+            flush=True,
+        )
+        return 0
+
+    # trackio.utils computes TRACKIO_DIR as a module-level constant the moment
+    # it's first imported (`TRACKIO_DIR = _get_trackio_dir()`), and every other
+    # trackio submodule (sqlite_storage, deploy, ...) picks up that frozen
+    # value. Setting the env var has to happen BEFORE any trackio import, or
+    # this has no effect and sync() silently reads whatever TRACKIO_DIR was at
+    # process start instead of the directory this flag exists to make explicit.
+    os.environ["TRACKIO_DIR"] = resolved_dir
+    try:
+        from trackio import deploy
+    except ImportError as exc:
+        print(f"phase=publish_db_failed reason=trackio_not_installed message={exc}", flush=True)
+        return 1
+
+    print(f"phase=publish_db_start project={project} trackio_dir={resolved_dir} space_id={space_id}", flush=True)
+    try:
+        result_space_id = deploy.sync(project=project, space_id=space_id, private=private, force=force)
+    except Exception as exc:
+        print(f"phase=publish_db_failed project={project} type={type(exc).__name__} message={exc}", flush=True)
+        return 1
+
+    print(f"phase=publish_db_done space_id={result_space_id} url=https://huggingface.co/spaces/{result_space_id}", flush=True)
+    return 0
+
+
+def set_space_visibility(space_id: str, private: bool, dry_run: bool) -> int:
+    """Flips visibility on an EXISTING Space.
+
+    create_space_if_not_exists()'s own docstring says its `private` argument
+    "is ignored if the repo already exists" -- so re-running publish_space()
+    with a different --private value does nothing to a Space that's already
+    there. This is the actual mechanism for changing visibility after the
+    fact, mirroring publish_adapters.py's --set-visibility for model repos.
+    """
+    if dry_run:
+        print(f"[DRY-RUN] would set Space {space_id} private={private}", flush=True)
+        return 0
+    try:
+        from huggingface_hub import HfApi
+
+        HfApi().update_repo_settings(repo_id=space_id, private=private, repo_type="space")
+        print(f"phase=space_visibility_done space_id={space_id} private={private}", flush=True)
+        return 0
+    except Exception as exc:
+        print(f"phase=space_visibility_failed space_id={space_id} type={type(exc).__name__} message={exc}", flush=True)
+        return 1
+
+
+def publish_space(space_id: str, private: bool, dry_run: bool) -> int:
+    """Creates (or confirms) the hosted Trackio Space for space_id.
+
+    Calls trackio's own deploy.create_space_if_not_exists() directly instead
+    of going through trackio.init(), which wraps this same call in a bare
+    try/except and only ever prints a non-fatal warning on failure -- easy to
+    miss in streamed training logs, and it swallows the actual error. This
+    function lets that error surface and fails the process on it, since
+    "the Space didn't get created" should be loud, not a warning buried in a
+    training run's stdout.
+    """
+    if dry_run:
+        print(f"[DRY-RUN] would create/confirm Space {space_id} (private={private})", flush=True)
+        return 0
+    try:
+        from trackio import deploy
+    except ImportError as exc:
+        print(f"phase=publish_space_failed reason=trackio_not_installed message={exc}", flush=True)
+        return 1
+
+    print(f"phase=publish_space_start space_id={space_id} private={private}", flush=True)
+    try:
+        created = deploy.create_space_if_not_exists(space_id, private=private)
+    except Exception as exc:
+        print(f"phase=publish_space_failed space_id={space_id} type={type(exc).__name__} message={exc}", flush=True)
+        return 1
+
+    space_url = f"https://huggingface.co/spaces/{space_id}"
+    print(f"phase=publish_space_done space_id={space_id} newly_created={created} url={space_url}", flush=True)
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -510,12 +672,18 @@ def main() -> None:
     train_p.add_argument("--lora-alpha", type=int, default=32, help="LoRA alpha.")
     train_p.add_argument("--lora-layers", type=int, default=24, help="LoRA layers for MLX.")
     train_p.add_argument("--trackio-project", default=DEFAULT_PROJECT, help="Trackio project name.")
+    train_p.add_argument("--trackio-group", default="", help="Trackio group label, for organizing runs within a shared project/Space.")
+    train_p.add_argument("--trackio-space-id", default="", help="Hosted Trackio Space id (e.g. user/space) to sync metrics to. Empty keeps logging local-only.")
+    train_p.add_argument("--trackio-private-space", action="store_true", help="Create the Trackio Space as private. Only used when --trackio-space-id is set.")
     train_p.add_argument(
         "--trackio-dir",
         default=os.environ.get("TRACKIO_DIR", "."),
         help="Directory for Trackio SQLite databases (defaults to current directory or TRACKIO_DIR).",
     )
     train_p.add_argument("--run-name", default="", help="Custom run name.")
+    train_p.add_argument("--push-to-hub", action="store_true", help="Push the trained adapter/model to a Hugging Face Hub repo after training completes.")
+    train_p.add_argument("--hub-model-id", default="", help="Hub model repo id to push to, e.g. user/model-name. Required with --push-to-hub.")
+    train_p.add_argument("--hub-private-repo", action=argparse.BooleanOptionalAction, default=True, help="Create the Hub model repo as private.")
     train_p.add_argument("--dry-run", action="store_true", help="Print command without executing.")
     train_p.add_argument(
         "--force",
@@ -562,6 +730,39 @@ def main() -> None:
         help="Directory to search for Trackio SQLite databases (defaults to current directory or TRACKIO_DIR).",
     )
 
+    # Publish-space subcommand
+    space_p = subparsers.add_parser(
+        "publish-space",
+        aliases=["ps"],
+        help="Create (or confirm) the hosted Trackio Space that --trackio-space-id points training runs at.",
+    )
+    space_p.add_argument("--space-id", required=True, help="Hub Space id to create/confirm, e.g. user/space-name.")
+    space_p.add_argument("--private", action=argparse.BooleanOptionalAction, default=True, help="Create the Space as private (default: yes). Ignored by the Hub if the Space already exists -- use --set-visibility to change an existing one.")
+    space_p.add_argument(
+        "--set-visibility",
+        choices=["public", "private"],
+        default=None,
+        help="Skip creation and just flip visibility on an EXISTING Space. --private above has no effect on an existing Space, so this is the actual way to make one public after the fact.",
+    )
+    space_p.add_argument("--dry-run", action="store_true", help="Print what would happen without touching the Hub.")
+
+    # Publish-db subcommand
+    db_p = subparsers.add_parser(
+        "publish-db",
+        aliases=["pd"],
+        help="Sync a local Trackio project's database to a Space (trackio.sync()). Source directory is explicit, not inherited from the shell's TRACKIO_DIR.",
+    )
+    db_p.add_argument("--project", default=DEFAULT_PROJECT, help="Trackio project name to sync.")
+    db_p.add_argument("--space-id", required=True, help="Hub Space id to sync to, e.g. user/space-name.")
+    db_p.add_argument(
+        "--trackio-dir",
+        required=True,
+        help="Directory holding the .db file to publish -- required and explicit, since this codebase has ended up with more than one local copy of the same project before (see compare_runs.py --diff).",
+    )
+    db_p.add_argument("--private", action=argparse.BooleanOptionalAction, default=True, help="Create the Space as private if it doesn't exist yet (default: yes).")
+    db_p.add_argument("--force", action="store_true", help="Overwrite the Space's existing database without prompting.")
+    db_p.add_argument("--dry-run", action="store_true", help="Print what would happen without touching the Hub.")
+
     args = parser.parse_args()
 
     if args.subcommand in ("train", "t"):
@@ -576,8 +777,14 @@ def main() -> None:
             lora_alpha=args.lora_alpha,
             lora_layers=args.lora_layers,
             trackio_project=args.trackio_project,
+            trackio_group=args.trackio_group,
+            trackio_space_id=args.trackio_space_id,
+            trackio_private_space=args.trackio_private_space,
             trackio_dir=args.trackio_dir,
             run_name=args.run_name,
+            push_to_hub=args.push_to_hub,
+            hub_model_id=args.hub_model_id,
+            hub_private_repo=args.hub_private_repo,
             dry_run=args.dry_run,
             force_restart=args.force_restart,
         )
@@ -599,6 +806,14 @@ def main() -> None:
         if args.trackio_dir:
             comp_cmd.extend(["--trackio-dir", args.trackio_dir])
         subprocess.run(comp_cmd)
+
+    elif args.subcommand in ("publish-space", "ps"):
+        if args.set_visibility is not None:
+            sys.exit(set_space_visibility(args.space_id, args.set_visibility == "private", args.dry_run))
+        sys.exit(publish_space(args.space_id, args.private, args.dry_run))
+
+    elif args.subcommand in ("publish-db", "pd"):
+        sys.exit(publish_db(args.project, args.space_id, args.trackio_dir, args.private, args.force, args.dry_run))
 
 
 if __name__ == "__main__":

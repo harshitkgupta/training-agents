@@ -3,6 +3,7 @@
 #   "mlx>=0.22.0; platform_system == 'Darwin'",
 #   "mlx-lm>=0.21.0; platform_system == 'Darwin'",
 #   "trackio>=0.3.0",
+#   "huggingface-hub>=1.1.0",
 # ]
 # ///
 
@@ -32,6 +33,14 @@ os.environ.setdefault("TRACKIO_DIR", os.path.abspath("."))
 
 DEFAULT_MODEL = "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
 DEFAULT_OUTPUT_DIR = "outputs/qwen-mlx-lora"
+
+# mlx_lm.lora's own CONFIG_DEFAULTS["lora_parameters"] (rank=8, dropout=0.0,
+# scale=20.0) as of mlx-lm>=0.21.0. This script has no flag to override rank
+# or scale -- only --lora-layers is passed through -- so every run actually
+# trains at these values. Logged into the Trackio config below (and not
+# silently assumed) so runs are self-describing; update this constant if the
+# mlx-lm dependency's own defaults ever change.
+MLX_LORA_DEFAULTS = {"rank": 8, "dropout": 0.0, "scale": 20.0}
 
 
 def find_default_data_dir() -> str:
@@ -113,11 +122,44 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--trackio-project", default="training-agents-sft", help="Trackio project name.")
     parser.add_argument("--trackio-run-name", default="", help="Trackio run name.")
     parser.add_argument(
+        "--trackio-group",
+        default="pi-mono-sft-sweep",
+        help="Trackio group label, used to organize runs within a shared project/Space.",
+    )
+    parser.add_argument(
+        "--trackio-space-id",
+        default="",
+        help="Hosted Trackio Space id (e.g. user/space) to sync metrics to. Empty keeps logging local-only.",
+    )
+    parser.add_argument(
+        "--trackio-private-space",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Create the Trackio Space as private. Only used when --trackio-space-id is set.",
+    )
+    parser.add_argument(
         "--trackio-dir",
         default=os.environ.get("TRACKIO_DIR", "."),
         help="Directory to store Trackio SQLite databases and media (defaults to current directory or TRACKIO_DIR).",
     )
     parser.add_argument("--no-trackio", action="store_true", help="Disable logging to Trackio.")
+    parser.add_argument(
+        "--push-to-hub",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Push the trained adapter to a Hugging Face Hub model repo after training completes.",
+    )
+    parser.add_argument(
+        "--hub-model-id",
+        default="",
+        help="Hub model repo id to push adapters to, e.g. user/model-name. Required with --push-to-hub.",
+    )
+    parser.add_argument(
+        "--hub-private-repo",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Create the Hub model repo as private.",
+    )
     return parser.parse_args(argv)
 
 
@@ -166,6 +208,9 @@ def main() -> None:
         sys.exit("Error: MLX LM only runs on macOS with Apple Silicon (Darwin arm64).")
 
     args = parse_args()
+    if args.push_to_hub and not args.hub_model_id:
+        sys.exit("Error: --push-to-hub requires --hub-model-id (e.g. --hub-model-id user/model-name).")
+
     data_dir = args.data or find_default_data_dir()
     train_file = Path(data_dir) / "train.jsonl"
     if not train_file.exists():
@@ -214,10 +259,18 @@ def main() -> None:
             import trackio
 
             run_name = args.trackio_run_name or f"qwen-mlx-{args.iters}iters"
-            print(f"phase=trackio_init project={args.trackio_project} run={run_name}", flush=True)
+            print(
+                "phase=trackio_init "
+                f"project={args.trackio_project} run={run_name} "
+                f"group={args.trackio_group} space_id={args.trackio_space_id or 'local'}",
+                flush=True,
+            )
             trackio.init(
                 project=args.trackio_project,
                 name=run_name,
+                group=args.trackio_group,
+                space_id=args.trackio_space_id or None,
+                private=args.trackio_private_space if args.trackio_space_id else None,
                 config={
                     "model": args.model,
                     "framework": "mlx",
@@ -225,6 +278,9 @@ def main() -> None:
                     "batch_size": args.batch_size,
                     "learning_rate": args.learning_rate,
                     "lora_layers": args.lora_layers,
+                    "lora_rank": MLX_LORA_DEFAULTS["rank"],
+                    "lora_scale": MLX_LORA_DEFAULTS["scale"],
+                    "lora_dropout": MLX_LORA_DEFAULTS["dropout"],
                     "max_seq_length": args.max_seq_length,
                     "grad_checkpoint": args.grad_checkpoint,
                 },
@@ -331,6 +387,61 @@ def main() -> None:
         pass
 
     print(f"phase=mlx_train_done adapter_path={args.adapter_path}", flush=True)
+
+    if args.push_to_hub and args.hub_model_id:
+        print(f"phase=push_to_hub hub_model_id={args.hub_model_id}", flush=True)
+        try:
+            from huggingface_hub import HfApi
+
+            api = HfApi()
+            api.create_repo(
+                repo_id=args.hub_model_id,
+                repo_type="model",
+                private=args.hub_private_repo,
+                exist_ok=True,
+            )
+            readme_path = Path(args.adapter_path) / "README.md"
+            if not readme_path.exists():
+                dashboard_line = (
+                    f"Trackio dashboard: https://huggingface.co/spaces/{args.trackio_space_id}\n\n"
+                    if args.trackio_space_id
+                    else ""
+                )
+                readme_path.write_text(
+                    "---\n"
+                    f"base_model: {args.model}\n"
+                    "library_name: mlx\n"
+                    "tags:\n"
+                    "  - mlx\n"
+                    "  - lora\n"
+                    "  - pi-mono\n"
+                    "---\n\n"
+                    f"# {args.hub_model_id.split('/')[-1]}\n\n"
+                    "LoRA adapter fine-tuned on `badlogicgames/pi-mono` coding-agent traces with Apple MLX.\n\n"
+                    f"- Base model: `{args.model}`\n"
+                    f"- Iterations: {args.iters}\n"
+                    f"- Max sequence length: {args.max_seq_length}\n"
+                    f"- LoRA layers: {args.lora_layers}\n"
+                    f"- LoRA rank/scale/dropout: {MLX_LORA_DEFAULTS['rank']}/"
+                    f"{MLX_LORA_DEFAULTS['scale']}/{MLX_LORA_DEFAULTS['dropout']} "
+                    "(mlx_lm.lora defaults; not overridable from this script)\n"
+                    f"- Learning rate: {args.learning_rate}\n\n"
+                    f"{dashboard_line}"
+                    "Trained with [training-agents](https://github.com/harshitkgupta/training-agents) "
+                    "`tutorials/01-sft-on-traces/train_mlx.py`.\n",
+                    encoding="utf-8",
+                )
+            # Skip numbered intermediate checkpoints (e.g. 0000100_adapters.safetensors);
+            # only the final adapters.safetensors, README, and any adapter config get pushed.
+            api.upload_folder(
+                folder_path=str(args.adapter_path),
+                repo_id=args.hub_model_id,
+                repo_type="model",
+                ignore_patterns=["[0-9]*_adapters.safetensors"],
+            )
+            print(f"phase=push_to_hub_done url=https://huggingface.co/{args.hub_model_id}", flush=True)
+        except Exception as exc:
+            print(f"phase=push_to_hub_warning type={type(exc).__name__} message={exc}", flush=True)
 
     if args.prompt:
         print("phase=mlx_test_generate", flush=True)

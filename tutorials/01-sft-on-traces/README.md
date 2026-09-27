@@ -36,7 +36,7 @@ commands, not datasets, checkpoints, logs, or generated outputs.
 - `run_experiments.py`: Orchestrator and suite runner across MPS, MLX, and serving benchmarks (TTFT & tokens/sec).
 - `compare_runs.py`: Cross-framework Trackio run inspector and metric comparison table generator.
 - `infer.py`: Interactive and programmatic test generation script for trained LoRA adapters.
-- `blog-apple-silicon-sft.md`: Publication-ready Hugging Face Community Blog post.
+- `../../blog/blog-apple-silicon-sft.md`: Publication-ready Hugging Face Community Blog post (images under `blog/assets/`, at the repo root).
 
 ## Apple Silicon SFT Experiments & Benchmark Suites
 
@@ -47,14 +47,15 @@ You can run individual training runs, curated experiment suites, serving benchma
 All experiments automatically handle checkpoint detection and auto-resumption:
 
 ```bash
-# Run all 8 benchmark experiments across MPS and MLX (509 steps = 1 full epoch)
+# Run all 10 benchmark experiments across MPS and MLX (509 steps = 1 full epoch)
 caffeinate -dimsu uv run tutorials/01-sft-on-traces/run_experiments.py suite --name all
 
 # Or run targeted sub-suites:
-# Framework Comparison (0.5B PyTorch MPS vs Apple MLX at 2k context)
+# Framework Comparison (0.5B MPS, 0.5B MLX 4-bit, and 0.5B MLX 16-bit at 2k context)
 caffeinate -dimsu uv run tutorials/01-sft-on-traces/run_experiments.py suite --name framework_comparison
 
-# Model Scaling (1.5B MPS, 1.5B MLX, 3B MLX at 2k context)
+# Model Scaling (1.5B MPS, 1.5B MLX 4-bit, 3B MLX 4-bit, and 1.5B MLX 16-bit -- same
+# model/context as the 4-bit row, no quantization -- at 2k context)
 caffeinate -dimsu uv run tutorials/01-sft-on-traces/run_experiments.py suite --name model_scaling
 
 # Context Scaling (1.5B MLX at 1k & 4k context; 1.5B MPS at 4k context)
@@ -352,6 +353,43 @@ results for the selected adapter:
 BigCodeBench and SWE-bench are not part of this default example because their
 Inspect tasks require Docker-backed execution. Standard Hugging Face Jobs in
 this environment did not expose a Docker daemon.
+
+## Publishing Adapters & a Shared Dashboard
+
+`train_mlx.py` and `run_experiments.py train` both support the same
+push-to-hub and hosted-Trackio-Space pattern already used in
+`02-distillation`, `03-reinforcement-learning`, and `04-environments` --
+opt-in per run, off by default:
+
+```bash
+uv run tutorials/01-sft-on-traces/run_experiments.py train \
+  --backend mlx --model Qwen/Qwen2.5-0.5B-Instruct --max-length 2048 --steps 509 \
+  --run-name qwen-0.5b-mlx16-2k \
+  --trackio-space-id harshitkgupta/training-agents-trackio \
+  --trackio-group mlx-precision-comparison \
+  --push-to-hub --hub-model-id harshitkgupta/qwen2.5-0.5b-pi-mono-mlx16-lora
+```
+
+- `--trackio-space-id` syncs metrics to a **hosted** Trackio Space instead of
+  (or in addition to) the local SQLite file, so runs are viewable without
+  local DB access and comparable across sessions and machines.
+  `harshitkgupta/training-agents-trackio` is the one shared Space intended
+  for all four tutorial sections in this repo -- use `--trackio-project` /
+  `--trackio-group` to keep each section's and each run type's curves
+  distinguishable within that one dashboard, rather than creating a new
+  Space per experiment.
+- `--push-to-hub --hub-model-id <user>/<name>` pushes the final adapter
+  (not intermediate checkpoints) to a private-by-default Hub model repo,
+  with an auto-generated model card. Nothing is pushed unless both flags
+  are passed explicitly -- this is a per-run decision, not automatic.
+- `train_sft.py` already supported both of these; this just brings
+  `train_mlx.py` and the `run_experiments.py` dispatcher up to the same
+  convention for the MPS side too.
+- To browse everything you've published across all four sections in one
+  place, group the pushed model repos into an [HF Hub
+  Collection](https://huggingface.co/collections) -- lighter-weight than a
+  custom leaderboard, and works for the training-curve dashboard's
+  linked models too.
 
 ## Known Limits
 
