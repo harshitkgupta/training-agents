@@ -13,7 +13,7 @@
 # ]
 # ///
 
-"""SFT Gemma 4 E2B-it on badlogicgames/pi-mono coding-agent traces.
+"""SFT a command-selected causal LM on badlogicgames/pi-mono coding-agent traces.
 
 This script intentionally avoids datasets.load_dataset("badlogicgames/pi-mono"):
 the Hub dataset is raw session JSONL and the dataset-server table generation can
@@ -32,20 +32,41 @@ import json
 import os
 import random
 import re
+import subprocess
 import sys
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+# Suppress PyTorch MPS DataLoader pin_memory warning (host pinned memory is unsupported and unneeded on unified memory)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*pin_memory.*",
+    category=UserWarning,
+)
 
-DEFAULT_MODEL_ID = "google/gemma-4-E2B-it"
+# Ensure PyTorch MPS watermark ratios are safe before any torch module initialization
+os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
+os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.0")
+
+# Default Trackio directory to the current working directory so database is created in pwd
+os.environ.setdefault("TRACKIO_DIR", os.path.abspath("."))
+
+
 DEFAULT_DATASET_ID = "badlogicgames/pi-mono"
 DEFAULT_PROJECT = "training-agents-sft"
-DEFAULT_RUN_NAME = "gemma4-e2b-it-pi-mono-lora"
-DEFAULT_LORA_TARGET_REGEX = (
-    r".*language_model\.layers\.\d+\."
-    r"(self_attn\.(q_proj|k_proj|v_proj|o_proj)|mlp\.(gate_proj|up_proj|down_proj))"
-    r"$"
+DECODER_LORA_SUFFIX = (
+    r"(self_attn\.(q_proj|k_proj|v_proj|o_proj)|mlp\.(gate_proj|up_proj|down_proj))$"
+)
+LORA_TARGET_REGEX_BY_FAMILY = {
+    "gemma": rf".*(?:language_model\.|model\.)?layers\.\d+\.{DECODER_LORA_SUFFIX}",
+    "qwen": rf".*(?:model\.)?layers\.\d+\.{DECODER_LORA_SUFFIX}",
+    "llama": rf".*(?:model\.)?layers\.\d+\.{DECODER_LORA_SUFFIX}",
+    "generic": rf".*layers\.\d+\.{DECODER_LORA_SUFFIX}",
+}
+GENERIC_LORA_FALLBACK_REGEX = (
+    r".*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$"
 )
 
 
@@ -172,13 +193,58 @@ class ConversionStats:
     skipped_empty_completion: int = 0
 
 
-def parse_args() -> argparse.Namespace:
+def infer_model_family(model_id: str) -> str:
+    slug = model_id.lower()
+    if "gemma" in slug:
+        return "gemma"
+    if "qwen" in slug:
+        return "qwen"
+    if "llama" in slug:
+        return "llama"
+    return "generic"
+
+
+def model_slug(model_id: str) -> str:
+    return model_id.rsplit("/", 1)[-1].lower().replace(".", "-")
+
+
+def apply_model_runtime_defaults(args: argparse.Namespace) -> None:
+    if not getattr(args, "model_family", ""):
+        args.model_family = infer_model_family(args.model_id)
+    slug = model_slug(args.model_id)
+    if not args.work_dir:
+        args.work_dir = f"workspaces/{slug}-pi-mono-sft"
+    if not args.output_dir:
+        args.output_dir = f"outputs/{slug}-pi-mono-lora"
+    if not args.run_name:
+        args.run_name = f"{slug}-pi-mono-lora"
+    print(
+        "phase=model_profile "
+        f"family={args.model_family} model_id={args.model_id} "
+        f"work_dir={args.work_dir} output_dir={args.output_dir} run_name={args.run_name}",
+        flush=True,
+    )
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
+    parser.add_argument(
+        "--model-id",
+        "--model",
+        dest="model_id",
+        required=True,
+        help="Hub model id, for example Qwen/Qwen2.5-0.5B-Instruct, Qwen/Qwen3-0.6B, or google/gemma-4-E2B-it.",
+    )
+    parser.add_argument(
+        "--model-family",
+        default="",
+        choices=("", "gemma", "qwen", "llama", "generic"),
+        help="Optional model family override. Inferred from --model-id if empty.",
+    )
     parser.add_argument("--dataset-id", default=DEFAULT_DATASET_ID)
     parser.add_argument("--raw-dir", default="")
-    parser.add_argument("--work-dir", default="workspaces/gemma4-pi-mono-sft")
-    parser.add_argument("--output-dir", default="outputs/gemma4-e2b-it-pi-mono-lora")
+    parser.add_argument("--work-dir", default="")
+    parser.add_argument("--output-dir", default="")
     parser.add_argument("--hub-model-id", default="")
     parser.add_argument("--push-to-hub", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--hub-private-repo", action=argparse.BooleanOptionalAction, default=True)
@@ -186,7 +252,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-tokenizer-check", action="store_true")
     parser.add_argument("--max-files", type=int, default=0)
     parser.add_argument("--max-examples", type=int, default=0)
-    parser.add_argument("--eval-size", type=int, default=256)
+    parser.add_argument("--eval-size", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-context-messages", type=int, default=18)
     parser.add_argument("--max-tool-result-chars", type=int, default=12000)
@@ -194,6 +260,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-assistant-chars", type=int, default=12000)
     parser.add_argument("--max-prompt-chars", type=int, default=64000)
     parser.add_argument("--include-reasoning", action="store_true")
+    parser.add_argument("--completion-only-loss", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--max-length", type=int, default=4096)
     parser.add_argument("--filter-overlength", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--max-steps", type=int, default=200)
@@ -212,18 +279,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--target-modules",
         default="",
-        help="Comma-separated module suffixes. Leave empty to use --target-modules-regex.",
+        help="Comma-separated LoRA module names. Leave empty to infer from --model-id.",
     )
-    parser.add_argument("--target-modules-regex", default=DEFAULT_LORA_TARGET_REGEX)
+    parser.add_argument(
+        "--target-modules-regex",
+        default="",
+        help="LoRA module regex. Leave empty to infer from --model-id family.",
+    )
     parser.add_argument("--load-in-4bit", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--device",
+        choices=("auto", "cuda", "mps", "cpu"),
+        default="auto",
+        help="Training device. Auto prefers CUDA, then Apple MPS, then CPU.",
+    )
     parser.add_argument("--trackio-project", default=DEFAULT_PROJECT)
     parser.add_argument("--trackio-space-id", default="")
     parser.add_argument("--trackio-group", default="pi-mono-sft-sweep")
     parser.add_argument("--trackio-private-space", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--run-name", default=DEFAULT_RUN_NAME)
-    return parser.parse_args()
+    parser.add_argument(
+        "--trackio-dir",
+        default=os.environ.get("TRACKIO_DIR", "."),
+        help="Directory to store Trackio SQLite databases and media (defaults to current directory or TRACKIO_DIR).",
+    )
+    parser.add_argument("--run-name", default="")
+    parser.add_argument(
+        "--resume-from-checkpoint",
+        default="",
+        help="Path to checkpoint directory, or 'auto' / 'true' to resume from latest checkpoint.",
+    )
+    return parser.parse_args(argv)
 
 
 def clip_text(text: str, max_chars: int) -> str:
@@ -431,20 +518,34 @@ def load_raw_events(path: Path, stats: ConversionStats) -> list[dict[str, Any]]:
     return events
 
 
+def apply_chat_template(processor: Any, messages: list[dict[str, Any]], **kwargs: Any) -> str:
+    try:
+        return processor.apply_chat_template(messages, **kwargs)
+    except TypeError:
+        kwargs.pop("enable_thinking", None)
+        try:
+            return processor.apply_chat_template(messages, **kwargs)
+        except TypeError:
+            kwargs.pop("tools", None)
+            return processor.apply_chat_template(messages, **kwargs)
+
+
 def render_prompt_completion(
     processor: Any,
     context: list[dict[str, Any]],
     assistant_message: dict[str, Any],
     tools: list[dict[str, Any]],
+    model_family: str,
 ) -> tuple[str, str]:
-    kwargs = {
-        "tokenize": False,
-        "enable_thinking": False,
-    }
+    kwargs: dict[str, Any] = {"tokenize": False}
     if tools:
         kwargs["tools"] = tools
-    prompt = processor.apply_chat_template(context, add_generation_prompt=True, **kwargs)
-    full = processor.apply_chat_template(context + [assistant_message], add_generation_prompt=False, **kwargs)
+    if model_family == "qwen":
+        kwargs["enable_thinking"] = False
+    prompt = apply_chat_template(processor, context, add_generation_prompt=True, **kwargs)
+    full = apply_chat_template(
+        processor, context + [assistant_message], add_generation_prompt=False, **kwargs
+    )
     if not full.startswith(prompt):
         raise ValueError("rendered full conversation does not start with rendered prompt")
     return prompt, full[len(prompt) :]
@@ -479,7 +580,9 @@ def build_examples(raw_dir: Path, processor: Any, args: argparse.Namespace) -> t
             if message["role"] == "assistant" and any(m.get("role") == "user" for m in conversation):
                 context = trim_context(conversation, args)
                 try:
-                    prompt, completion = render_prompt_completion(processor, context, message, tools)
+                    prompt, completion = render_prompt_completion(
+                        processor, context, message, tools, args.model_family
+                    )
                 except Exception:
                     stats.skipped_render_errors += 1
                 else:
@@ -614,36 +717,120 @@ def make_dataset_splits(examples: list[dict[str, Any]], args: argparse.Namespace
     return Dataset.from_list(train_rows), Dataset.from_list(eval_rows)
 
 
+def match_lora_modules(model: Any, pattern: re.Pattern[str]) -> list[tuple[str, Any]]:
+    return [(name, module) for name, module in model.named_modules() if pattern.fullmatch(name)]
+
+
 def resolve_lora_target_modules(model: Any, args: argparse.Namespace) -> list[str]:
+    modules = [part.strip() for part in args.target_modules.split(",") if part.strip()]
+    if modules:
+        print(
+            "phase=lora_targets "
+            f"mode=explicit count={len(modules)} family={args.model_family} "
+            f"modules={json.dumps(modules, sort_keys=True)}",
+            flush=True,
+        )
+        return modules
+
+    regexes: list[str] = []
     if args.target_modules_regex:
-        pattern = re.compile(args.target_modules_regex)
-        matched_modules = [(name, module) for name, module in model.named_modules() if pattern.fullmatch(name)]
+        regexes.append(args.target_modules_regex)
+    else:
+        regexes.append(LORA_TARGET_REGEX_BY_FAMILY[args.model_family])
+        if args.model_family != "generic":
+            regexes.append(LORA_TARGET_REGEX_BY_FAMILY["generic"])
+        regexes.append(GENERIC_LORA_FALLBACK_REGEX)
+
+    seen: set[str] = set()
+    unique_regexes = []
+    for regex in regexes:
+        if regex not in seen:
+            seen.add(regex)
+            unique_regexes.append(regex)
+
+    for regex in unique_regexes:
+        pattern = re.compile(regex)
+        matched_modules = match_lora_modules(model, pattern)
+        if not matched_modules:
+            print(f"phase=lora_targets_miss family={args.model_family} regex={regex}", flush=True)
+            continue
         matches = [name for name, _module in matched_modules]
-        if not matches:
-            raise RuntimeError(f"no LoRA target modules matched regex: {args.target_modules_regex}")
         sample = [
             {"name": name, "type": type(module).__name__}
             for name, module in matched_modules[:8]
         ]
         print(
             "phase=lora_targets "
-            f"mode=regex count={len(matches)} sample={json.dumps(sample, sort_keys=True)}",
+            f"mode=regex family={args.model_family} count={len(matches)} "
+            f"regex={regex} sample={json.dumps(sample, sort_keys=True)}",
             flush=True,
         )
         return matches
 
-    modules = [part.strip() for part in args.target_modules.split(",") if part.strip()]
-    if not modules:
-        raise ValueError("no LoRA target modules configured")
-    print(
-        "phase=lora_targets "
-        f"mode=suffix count={len(modules)} modules={json.dumps(modules, sort_keys=True)}",
-        flush=True,
+    raise RuntimeError(
+        f"no LoRA target modules matched for family={args.model_family} model_id={args.model_id}"
     )
-    return modules
+
+
+def get_system_device_info(runtime_device: str) -> dict[str, Any]:
+    info: dict[str, Any] = {"runtime_device": runtime_device}
+    if runtime_device == "mps":
+        try:
+            brand = subprocess.check_output(["sysctl", "-n", "machdep.cpu.brand_string"], text=True).strip()
+            info["chip"] = brand
+        except Exception:
+            pass
+        try:
+            mem_bytes = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True).strip())
+            info["unified_memory_gb"] = round(mem_bytes / (1024**3), 2)
+        except Exception:
+            pass
+    return info
+
+
+def make_mps_telemetry_callback() -> Any:
+    import torch
+    from transformers import TrainerCallback
+
+    class MPSTelemetryCallback(TrainerCallback):
+        def __init__(self) -> None:
+            self.peak_allocated_mb: float = 0.0
+
+        def on_step_end(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
+            if torch.backends.mps.is_available():
+                current_mb = torch.mps.current_allocated_memory() / (1024 * 1024)
+                self.peak_allocated_mb = max(self.peak_allocated_mb, current_mb)
+                if torch.mps.driver_allocated_memory() > 6 * 1024 * 1024 * 1024:
+                    torch.mps.empty_cache()
+
+        def on_log(
+            self,
+            args: Any,
+            state: Any,
+            control: Any,
+            logs: dict[str, Any] | None = None,
+            **kwargs: Any,
+        ) -> None:
+            if logs is not None and torch.backends.mps.is_available():
+                current_mb = round(torch.mps.current_allocated_memory() / (1024 * 1024), 2)
+                driver_mb = round(torch.mps.driver_allocated_memory() / (1024 * 1024), 2)
+                self.peak_allocated_mb = max(self.peak_allocated_mb, current_mb)
+                logs["mps_allocated_mb"] = current_mb
+                logs["mps_driver_mb"] = driver_mb
+                logs["mps_peak_mb"] = round(self.peak_allocated_mb, 2)
+
+    return MPSTelemetryCallback()
 
 
 def train(examples: list[dict[str, Any]], processor: Any, stats: ConversionStats, args: argparse.Namespace) -> None:
+    if args.trackio_dir:
+        resolved_trackio_dir = str(Path(args.trackio_dir).resolve())
+        os.environ["TRACKIO_DIR"] = resolved_trackio_dir
+        Path(resolved_trackio_dir).mkdir(parents=True, exist_ok=True)
+    os.environ["TRACKIO_PROJECT"] = args.trackio_project
+    if args.trackio_space_id:
+        os.environ["TRACKIO_SPACE_ID"] = args.trackio_space_id
+
     import trackio
     import torch
     from huggingface_hub import HfApi
@@ -651,20 +838,65 @@ def train(examples: list[dict[str, Any]], processor: Any, stats: ConversionStats
     from transformers import AutoModelForCausalLM, BitsAndBytesConfig
     from trl import SFTConfig, SFTTrainer
 
+    mps_available = bool(getattr(torch.backends, "mps", None) and torch.backends.mps.is_available())
+    if args.device == "auto":
+        runtime_device = "cuda" if torch.cuda.is_available() else "mps" if mps_available else "cpu"
+    else:
+        runtime_device = args.device
+    if runtime_device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("--device cuda was requested, but CUDA is not available")
+    if runtime_device == "mps" and not mps_available:
+        raise RuntimeError("--device mps was requested, but Apple MPS is not available")
+
+    # bitsandbytes 4-bit loading and paged optimizers require CUDA. Apple MPS
+    # uses native PyTorch FP16 instead, so make the portable default safe.
+    runtime_load_in_4bit = args.load_in_4bit
+    runtime_bf16 = args.bf16
+    if runtime_device == "mps":
+        if runtime_load_in_4bit:
+            print("phase=device_adjustment device=mps load_in_4bit=false", flush=True)
+            runtime_load_in_4bit = False
+        if runtime_bf16:
+            print("phase=device_adjustment device=mps bf16=false fp16=true", flush=True)
+            runtime_bf16 = False
+    if runtime_device == "cpu" and runtime_bf16:
+        print("phase=device_adjustment device=cpu bf16=false", flush=True)
+        runtime_bf16 = False
+    print(f"phase=device device={runtime_device}", flush=True)
+    if runtime_device == "mps":
+        sys_info = get_system_device_info(runtime_device)
+        print(
+            "phase=device_info "
+            f"device=mps chip={json.dumps(sys_info.get('chip', 'Apple Silicon'))} "
+            f"unified_memory_gb={sys_info.get('unified_memory_gb', 'unknown')}",
+            flush=True,
+        )
+
     def finish_trackio_safely() -> None:
         try:
             trackio.finish()
         except RuntimeError as exc:
             if "Call trackio.init() before trackio.finish()" in str(exc):
-                return
-            print(f"phase=trackio_finish_warning type={type(exc).__name__} message={exc}", flush=True)
+                pass
+            else:
+                print(f"phase=trackio_finish_warning type={type(exc).__name__} message={exc}", flush=True)
         except Exception as exc:
             print(f"phase=trackio_finish_warning type={type(exc).__name__} message={exc}", flush=True)
-
-    os.environ.setdefault("TRACKIO_PROJECT", args.trackio_project)
-    os.environ.setdefault("TRACKIO_DIR", str(Path(args.output_dir) / "trackio"))
-    if args.trackio_space_id:
-        os.environ.setdefault("TRACKIO_SPACE_ID", args.trackio_space_id)
+        try:
+            import glob, sqlite3
+            db_dirs = [os.path.expanduser("~/.cache/huggingface/trackio")]
+            if os.environ.get("TRACKIO_DIR"):
+                db_dirs.insert(0, os.environ["TRACKIO_DIR"])
+            for db_dir in db_dirs:
+                for db_file in glob.glob(os.path.join(db_dir, "*.db")):
+                    try:
+                        c = sqlite3.connect(db_file)
+                        c.execute("PRAGMA wal_checkpoint(FULL);")
+                        c.close()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     trackio_config = {
         "model": args.model_id,
@@ -675,13 +907,16 @@ def train(examples: list[dict[str, Any]], processor: Any, stats: ConversionStats
         "batch_size": args.per_device_train_batch_size * args.gradient_accumulation_steps,
         "max_length": args.max_length,
         "max_steps": args.max_steps,
+        "device": runtime_device,
+        "load_in_4bit": runtime_load_in_4bit,
         "lora_r": args.lora_r,
         "lora_alpha": args.lora_alpha,
         "lora_dropout": args.lora_dropout,
+        "model_family": args.model_family,
         "target_modules_regex": args.target_modules_regex,
         "target_modules": args.target_modules,
         "hub_model_id": args.hub_model_id,
-        "completion_only_loss": True,
+        "completion_only_loss": args.completion_only_loss,
     }
     print(
         "phase=trackio_init "
@@ -713,22 +948,38 @@ def train(examples: list[dict[str, Any]], processor: Any, stats: ConversionStats
     tokenizer.padding_side = "right"
 
     quantization_config = None
-    if args.load_in_4bit:
+    if runtime_load_in_4bit:
         quantization_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16 if args.bf16 else torch.float16,
+            bnb_4bit_compute_dtype=torch.bfloat16 if runtime_bf16 else torch.float16,
             bnb_4bit_use_double_quant=True,
         )
 
+    dtype = torch.bfloat16 if runtime_bf16 else torch.float16 if runtime_device == "mps" else "auto"
+    model_kwargs: dict[str, Any] = {
+        "torch_dtype": dtype,
+        "device_map": "auto" if runtime_device == "cuda" else None,
+        "quantization_config": quantization_config,
+    }
+    if runtime_device in ("mps", "cuda"):
+        model_kwargs["attn_implementation"] = "sdpa"
+
     print("phase=load_model", flush=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_id,
-        dtype=torch.bfloat16 if args.bf16 else "auto",
-        device_map="auto",
-        quantization_config=quantization_config,
-    )
+    try:
+        model = AutoModelForCausalLM.from_pretrained(args.model_id, **model_kwargs)
+    except (ValueError, TypeError):
+        model_kwargs.pop("attn_implementation", None)
+        model = AutoModelForCausalLM.from_pretrained(args.model_id, **model_kwargs)
+
+    if runtime_device == "mps":
+        model.to("mps")
     model.config.use_cache = False
+
+    if runtime_device == "mps" and torch.backends.mps.is_available():
+        alloc_mb = round(torch.mps.current_allocated_memory() / (1024 * 1024), 2)
+        driver_mb = round(torch.mps.driver_allocated_memory() / (1024 * 1024), 2)
+        print(f"phase=mps_memory_post_load allocated_mb={alloc_mb} driver_allocated_mb={driver_mb}", flush=True)
 
     train_ds, eval_ds = make_dataset_splits(examples, args)
     lora_target_modules = resolve_lora_target_modules(model, args)
@@ -741,11 +992,13 @@ def train(examples: list[dict[str, Any]], processor: Any, stats: ConversionStats
         target_modules=lora_target_modules,
     )
 
-    optim = "paged_adamw_8bit" if args.load_in_4bit else "adamw_torch"
+    optim = "paged_adamw_8bit" if runtime_load_in_4bit else "adamw_torch"
     training_args = SFTConfig(
         output_dir=args.output_dir,
+        project=args.trackio_project,
+        trackio_space_id=args.trackio_space_id or None,
         max_length=args.max_length,
-        completion_only_loss=True,
+        completion_only_loss=args.completion_only_loss,
         packing=False,
         learning_rate=args.learning_rate,
         max_steps=args.max_steps,
@@ -754,15 +1007,18 @@ def train(examples: list[dict[str, Any]], processor: Any, stats: ConversionStats
         per_device_eval_batch_size=args.per_device_eval_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         gradient_checkpointing=args.gradient_checkpointing,
+        gradient_checkpointing_kwargs={"use_reentrant": False} if args.gradient_checkpointing else None,
+        dataloader_num_workers=0,
         logging_steps=args.logging_steps,
         eval_strategy="steps" if len(eval_ds) else "no",
         eval_steps=args.eval_steps,
         save_steps=args.save_steps,
         save_total_limit=args.save_total_limit,
-        bf16=args.bf16,
+        bf16=runtime_bf16,
+        fp16=(not runtime_bf16) and runtime_device in ("mps", "cuda"),
         optim=optim,
         lr_scheduler_type="cosine",
-        warmup_ratio=0.03,
+        warmup_steps=max(1, int(0.03 * args.max_steps)) if args.max_steps > 0 else 10,
         report_to="trackio",
         run_name=args.run_name,
         push_to_hub=args.push_to_hub,
@@ -771,6 +1027,7 @@ def train(examples: list[dict[str, Any]], processor: Any, stats: ConversionStats
         seed=args.seed,
         data_seed=args.seed,
         remove_unused_columns=True,
+        dataloader_pin_memory=False if runtime_device == "mps" else True,
     )
 
     write_json(
@@ -778,11 +1035,12 @@ def train(examples: list[dict[str, Any]], processor: Any, stats: ConversionStats
         {
             **stats.__dict__,
             "model_id": args.model_id,
+            "model_family": args.model_family,
             "dataset_id": args.dataset_id,
             "train_examples": len(train_ds),
             "eval_examples": len(eval_ds),
             "max_length": args.max_length,
-            "completion_only_loss": True,
+            "completion_only_loss": args.completion_only_loss,
             "include_reasoning": args.include_reasoning,
         },
     )
@@ -790,9 +1048,15 @@ def train(examples: list[dict[str, Any]], processor: Any, stats: ConversionStats
     print(
         "phase=train_start "
         f"train_examples={len(train_ds)} eval_examples={len(eval_ds)} "
-        f"model={args.model_id} hub_model_id={args.hub_model_id or 'none'}",
+        f"model={args.model_id} family={args.model_family} hub_model_id={args.hub_model_id or 'none'}",
         flush=True,
     )
+    callbacks = []
+    mps_callback = None
+    if runtime_device == "mps":
+        mps_callback = make_mps_telemetry_callback()
+        callbacks.append(mps_callback)
+
     trainer = SFTTrainer(
         model=model,
         args=training_args,
@@ -800,13 +1064,36 @@ def train(examples: list[dict[str, Any]], processor: Any, stats: ConversionStats
         eval_dataset=eval_ds if len(eval_ds) else None,
         peft_config=peft_config,
         processing_class=tokenizer,
+        callbacks=callbacks if callbacks else None,
     )
-    train_result = trainer.train()
+
+    # Ensure MPSTelemetryCallback executes before integration callbacks (e.g. TrackioCallback)
+    if mps_callback is not None and hasattr(trainer, "callback_handler"):
+        if mps_callback in trainer.callback_handler.callbacks:
+            trainer.callback_handler.callbacks.remove(mps_callback)
+        trainer.callback_handler.callbacks.insert(0, mps_callback)
+    resume_checkpoint = None
+    if args.resume_from_checkpoint:
+        if args.resume_from_checkpoint.lower() in ("true", "auto", "1"):
+            resume_checkpoint = True
+        else:
+            resume_checkpoint = args.resume_from_checkpoint
+        print(f"phase=resume_from_checkpoint target={resume_checkpoint}", flush=True)
+
+    train_result = trainer.train(resume_from_checkpoint=resume_checkpoint)
     trainer.save_model(args.output_dir)
+    tokenizer.save_pretrained(args.output_dir)
     trainer.save_state()
     metrics = dict(train_result.metrics)
     metrics["train_examples"] = len(train_ds)
     metrics["eval_examples"] = len(eval_ds)
+    if runtime_device == "mps" and torch.backends.mps.is_available():
+        final_alloc_mb = round(torch.mps.current_allocated_memory() / (1024 * 1024), 2)
+        final_driver_mb = round(torch.mps.driver_allocated_memory() / (1024 * 1024), 2)
+        peak_mb = round(getattr(mps_callback, "peak_allocated_mb", final_alloc_mb), 2)
+        metrics["peak_mps_allocated_mb"] = peak_mb
+        metrics["final_mps_driver_mb"] = final_driver_mb
+        torch.mps.empty_cache()
     trainer.save_metrics("train", metrics)
 
     if len(eval_ds):
@@ -818,12 +1105,31 @@ def train(examples: list[dict[str, Any]], processor: Any, stats: ConversionStats
             ),
             None,
         )
+        if final_eval_metrics is None:
+            try:
+                final_eval_metrics = trainer.evaluate()
+            except Exception:
+                pass
         if final_eval_metrics:
             trainer.save_metrics("eval", final_eval_metrics)
 
     if args.push_to_hub:
         print("phase=push_to_hub", flush=True)
         trainer.push_to_hub()
+
+    try:
+        write_json(
+            Path(args.output_dir) / "COMPLETED",
+            {
+                "run_name": args.run_name,
+                "global_step": int(trainer.state.global_step),
+                "max_steps": args.max_steps,
+                "train_loss": float(train_result.training_loss) if hasattr(train_result, "training_loss") else None,
+                "completed": True,
+            },
+        )
+    except Exception:
+        pass
 
     finish_trackio_safely()
     atexit.unregister(finish_trackio_safely)
@@ -832,6 +1138,7 @@ def train(examples: list[dict[str, Any]], processor: Any, stats: ConversionStats
 
 def main() -> None:
     args = parse_args()
+    apply_model_runtime_defaults(args)
     random.seed(args.seed)
     raw_dir = download_dataset(args)
     processor = load_processor(args.model_id)
@@ -842,9 +1149,24 @@ def main() -> None:
 
     work_dir = Path(args.work_dir)
     write_jsonl(work_dir / "prepared_examples.sample.jsonl", examples[: min(100, len(examples))])
+    shuffled_rows = list(examples)
+    random.Random(args.seed).shuffle(shuffled_rows)
+    eval_size = min(args.eval_size, max(1, len(shuffled_rows) // 20)) if args.eval_size > 0 else 0
+    mlx_dir = work_dir / "mlx_data"
+    mlx_rows = [
+        {
+            "prompt": row["prompt"],
+            "completion": row["completion"],
+            "text": row["prompt"] + row["completion"],
+        }
+        for row in shuffled_rows
+    ]
+    write_jsonl(mlx_dir / "train.jsonl", mlx_rows[eval_size:])
+    write_jsonl(mlx_dir / "valid.jsonl", mlx_rows[:eval_size])
     summary: dict[str, Any] = {
         **stats.__dict__,
         "model_id": args.model_id,
+        "model_family": args.model_family,
         "dataset_id": args.dataset_id,
         "raw_dir": str(raw_dir),
         "examples": len(examples),
