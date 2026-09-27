@@ -6,7 +6,7 @@ builds on the training signal introduced by the previous one.
 
 ## Learning order
 
-1. [01 — SFT on traces](01-sft-on-traces/) — fine-tune Gemma 4 on pi-mono
+1. [01 — SFT on traces](01-sft-on-traces/) — fine-tune Gemma 4 or Qwen on pi-mono
    coding-agent traces with completion-only loss. [Session video](https://www.youtube.com/watch?v=rNgUoH7Wbv8)
    · [public slides](https://docs.google.com/presentation/d/1hcGZ4U9TjZZzcGNbH2K6wYD45qwZTyo_gosCQsnHlnc/edit)
 2. [02 — Distillation](02-distillation/) — train a smaller policy against a

@@ -1,8 +1,13 @@
-# Gemma 4 E2B Pi-Mono SFT
+# Pi-Mono SFT
 
-Reusable SFT example for fine-tuning `google/gemma-4-E2B-it` on
+Reusable SFT example for fine-tuning a command-selected causal LM on
 `badlogicgames/pi-mono` coding-agent traces with TRL, PEFT LoRA, Hugging Face
-Jobs, and a hosted Trackio dashboard.
+Jobs, and Trackio. Pass `--model-id`; the script infers LoRA targets, chat
+template kwargs, work/output dirs, and run name from the model family
+(Gemma, Qwen, Llama, or generic).
+
+The verified Jobs sweep used `google/gemma-4-E2B-it`. Local MacBook smokes
+usually pass `Qwen/Qwen3-0.6B`.
 
 This example is intentionally lightweight: it checks in the runnable script and
 commands, not datasets, checkpoints, logs, or generated outputs.
@@ -15,19 +20,140 @@ commands, not datasets, checkpoints, logs, or generated outputs.
 - excludes hidden reasoning by default
 - omits images as `[image omitted]`
 - trains with TRL `SFTTrainer` and completion-only loss
-- applies LoRA only to Gemma 4 language decoder projections
+- applies LoRA to the decoder for the selected `--model-id` family
+  (Gemma: `language_model.layers.*`; Qwen/Llama: `layers.*` attention/MLP)
 - logs remote runs to Trackio Space `burtenshaw/pi-mono-sft-trackio`
 - pushes adapters to private Hub model repos
-- mirrors the selected best adapter to final repo
+- the Gemma 4 sweep mirrored the selected best adapter to
   `burtenshaw/gemma-4-E2B-it-pi-mono-lora`
 - evaluates the final adapter with Inspect AI HumanEval and MBPP coding
   benchmarks
 
 ## Files
 
-- `train_sft.py`: PEP 723 UV script for local smoke runs and HF Jobs.
+- `train_sft.py`: TRL SFTTrainer script for PyTorch MPS and CUDA, supporting completion-only loss, PEFT LoRA, and Trackio.
+- `train_mlx.py`: Apple MLX 4-bit QLoRA fine-tuning script with real-time Trackio telemetry streaming.
+- `run_experiments.py`: Orchestrator and suite runner across MPS, MLX, and serving benchmarks (TTFT & tokens/sec).
+- `compare_runs.py`: Cross-framework Trackio run inspector and metric comparison table generator.
+- `infer.py`: Interactive and programmatic test generation script for trained LoRA adapters.
+- `blog-apple-silicon-sft.md`: Publication-ready Hugging Face Community Blog post.
+
+## Apple Silicon SFT Experiments & Benchmark Suites
+
+You can run individual training runs, curated experiment suites, serving benchmarks, and comparison reports using `run_experiments.py`.
+
+### 1. Run Curated Experiment Suites
+
+All experiments automatically handle checkpoint detection and auto-resumption:
+
+```bash
+# Run all 8 benchmark experiments across MPS and MLX (509 steps = 1 full epoch)
+caffeinate -dimsu uv run tutorials/01-sft-on-traces/run_experiments.py suite --name all
+
+# Or run targeted sub-suites:
+# Framework Comparison (0.5B PyTorch MPS vs Apple MLX at 2k context)
+caffeinate -dimsu uv run tutorials/01-sft-on-traces/run_experiments.py suite --name framework_comparison
+
+# Model Scaling (1.5B MPS, 1.5B MLX, 3B MLX at 2k context)
+caffeinate -dimsu uv run tutorials/01-sft-on-traces/run_experiments.py suite --name model_scaling
+
+# Context Scaling (1.5B MLX at 1k & 4k context; 1.5B MPS at 4k context)
+caffeinate -dimsu uv run tutorials/01-sft-on-traces/run_experiments.py suite --name context_scaling
+```
+
+### 2. Run Individual Parameterized Experiments
+
+```bash
+# Run PyTorch MPS 1.5B at 2k context (with active MPSTelemetryCallback VRAM tracking):
+uv run tutorials/01-sft-on-traces/run_experiments.py train \
+  --backend mps --model 1.5b --max-length 2048 --steps 509 --run-name qwen-1.5b-mps-2k
+
+# Run Apple MLX 3B at 2k context (native 4-bit QLoRA, micro-batching, cache clearing):
+uv run tutorials/01-sft-on-traces/run_experiments.py train \
+  --backend mlx --model 3b --max-length 2048 --steps 509 --run-name qwen-3b-mlx-2k
+```
+
+### 3. Compare All Runs & Generate Metrics Table
+
+Inspect local SQLite Trackio databases and print the consolidated comparison table:
+
+```bash
+# Inspects Trackio database (*.db) in current working directory by default:
+uv run tutorials/01-sft-on-traces/compare_runs.py
+
+# Or inspect an explicit directory or specific .db file:
+uv run tutorials/01-sft-on-traces/compare_runs.py --trackio-dir /path/to/dir
+```
+
+#### Trackio Database Location (Current Folder by Default)
+
+All training runs and suite experiments create and log metrics to `<project>.db` (e.g. `training-agents-sft.db`) directly in the **current working directory (`$PWD`)** by default.
+
+- To override the database location across all scripts, pass `--trackio-dir <path>` or set `export TRACKIO_DIR="/custom/path"`.
+- `compare_runs.py` strictly inspects the configured location (`--trackio-dir` or `TRACKIO_DIR`, defaulting to `$PWD`), with no hidden cache searching.
+
+
+### 4. Benchmark Serving Latency & Throughput (MPS vs MLX)
+
+Measures Time-To-First-Token (TTFT) and decode tokens/second across prompt lengths (256, 1024, 2048 tokens):
+
+```bash
+uv run tutorials/01-sft-on-traces/run_experiments.py bench-serving --model 0.5b
+```
+
+### 5. Test Inference with Trained Adapters
+
+```bash
+uv run tutorials/01-sft-on-traces/infer.py \
+  --model-id Qwen/Qwen2.5-0.5B-Instruct \
+  --adapter-path outputs/qwen-0.5b-mps-2k \
+  --prompt "Read file main.py and list the functions."
+```
 
 ## Local Smoke
+
+`--model-id` is required. On a MacBook, start with Qwen 0.6B:
+
+```bash
+uv run tutorials/01-sft-on-traces/train_sft.py \
+  --model-id Qwen/Qwen3-0.6B \
+  --dataset-id badlogicgames/pi-mono \
+  --device mps \
+  --max-examples 64 \
+  --eval-size 8 \
+  --max-length 1024 \
+  --max-steps 1 \
+  --gradient-accumulation-steps 1 \
+  --logging-steps 1 \
+  --eval-steps 1 \
+  --save-steps 1 \
+  --trackio-project training-agents-sft \
+  --trackio-group pi-mono-sft-smoke
+
+# View local metrics in the interactive dashboard
+uv run trackio show --project training-agents-sft
+```
+
+### Native 4-bit QLoRA on Apple Silicon with MLX (`mlx-lm`)
+
+For native 4-bit quantized fine-tuning (QLoRA) on Apple Silicon, use the companion script `train_mlx.py` powered by Apple's `mlx-lm`:
+
+```bash
+# 1. Prepare data splits (creates workspaces/qwen3-0-6b-pi-mono-sft/mlx_data/train.jsonl)
+uv run tutorials/01-sft-on-traces/train_sft.py \
+  --model-id Qwen/Qwen3-0.6B \
+  --prepare-only
+
+# 2. Fine-tune with MLX 4-bit QLoRA
+uv run tutorials/01-sft-on-traces/train_mlx.py \
+  --model mlx-community/Qwen2.5-0.5B-Instruct-4bit \
+  --iters 100 \
+  --batch-size 1 \
+  --adapter-path outputs/qwen-mlx-lora \
+  --prompt "Read file main.py and list the functions."
+```
+
+Gemma 4 E2B on CUDA or HF Jobs:
 
 ```bash
 uv run tutorials/01-sft-on-traces/train_sft.py \

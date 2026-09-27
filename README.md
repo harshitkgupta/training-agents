@@ -14,8 +14,8 @@ directories or separate project repositories.
 
 Follow the four practical [Training Agents tutorials](tutorials/) in order:
 
-1. [SFT on traces](tutorials/01-sft-on-traces/) — Gemma 4 fine-tuning on
-   pi-mono coding-agent traces.
+1. [SFT on traces](tutorials/01-sft-on-traces/) — Gemma 4 or Qwen SFT on
+   pi-mono coding-agent traces (`--model-id` selects the family).
 2. [Distillation](tutorials/02-distillation/) — off-policy logit KD and
    on-policy GKD.
 3. [Reinforcement learning](tutorials/03-reinforcement-learning/) — GRPO with
